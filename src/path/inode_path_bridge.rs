@@ -1191,6 +1191,14 @@ where
         lock_owner: u64,
     ) -> Result<ReplyDirectoryPlus<impl Stream<Item = Result<DirectoryEntryPlus>> + Send + '_>>
     {
+        // The guard owns every count from the first one on, also if this call is
+        // cancelled while the listing runs. It is made before the lock is taken,
+        // so it is dropped after the lock and can give counts back at once.
+        let mut reply = CountedEntries {
+            entries: VecDeque::new(),
+            last: None,
+            inode_name_manager: self.inode_name_manager.clone(),
+        };
         let mut inode_name_manager = self.inode_name_manager.write().await;
         let parent_path = inode_name_manager
             .get_absolute_path(parent)
@@ -1204,15 +1212,14 @@ where
         let entries = children.entries;
         futures_util::pin_mut!(entries);
 
-        let entries_size = entries.size_hint().1.unwrap_or(0);
-        let mut entry_list = VecDeque::with_capacity(entries_size);
+        reply.entries.reserve(entries.size_hint().1.unwrap_or(0));
 
         while let Some(entry) = entries.next().await {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
                     // nothing reaches the kernel: give back the counts taken so far
-                    for (_, counted) in entry_list {
+                    for (_, counted) in reply.entries.drain(..) {
                         if let Some(inode) = counted {
                             inode_name_manager.forget(inode, 1);
                         }
@@ -1249,7 +1256,7 @@ where
                 inode
             };
 
-            entry_list.push_back((
+            reply.entries.push_back((
                 DirectoryEntryPlus {
                     inode,
                     generation: 0,
@@ -1264,13 +1271,9 @@ where
             ));
         }
 
-        Ok(ReplyDirectoryPlus {
-            entries: CountedEntries {
-                entries: entry_list,
-                last: None,
-                inode_name_manager: self.inode_name_manager.clone(),
-            },
-        })
+        drop(inode_name_manager);
+
+        Ok(ReplyDirectoryPlus { entries: reply })
     }
 
     async fn rename2(
@@ -1461,6 +1464,8 @@ mod tests {
     /// `fail_after` entries if set.
     struct Listing {
         fail_after: Option<usize>,
+        /// the listing waits forever after this many entries
+        stall_after: Option<usize>,
     }
 
     impl PathFilesystem for Listing {
@@ -1546,9 +1551,12 @@ mod tests {
                 })
             });
 
-            Ok(crate::path::reply::ReplyDirectoryPlus {
-                entries: stream::iter(entries),
-            })
+            let stall_after = self.stall_after;
+            let entries = stream::iter(entries)
+                .take(stall_after.unwrap_or(usize::MAX))
+                .chain(stream::iter(stall_after).flat_map(|_| stream::pending()));
+
+            Ok(crate::path::reply::ReplyDirectoryPlus { entries })
         }
     }
 
@@ -1586,7 +1594,10 @@ mod tests {
 
     #[test]
     fn readdirplus_counts_only_entries_that_were_packed() {
-        let bridge = InodePathBridge::new(Listing { fail_after: None });
+        let bridge = InodePathBridge::new(Listing {
+            fail_after: None,
+            stall_after: None,
+        });
         let reply = now(bridge.readdirplus(request(), ROOT_INODE, 0, 0, 0)).unwrap();
         let mut entries = Box::pin(reply.entries);
 
@@ -1601,7 +1612,10 @@ mod tests {
 
     #[test]
     fn readdirplus_counts_all_entries_of_a_whole_listing() {
-        let bridge = InodePathBridge::new(Listing { fail_after: None });
+        let bridge = InodePathBridge::new(Listing {
+            fail_after: None,
+            stall_after: None,
+        });
         let reply = now(bridge.readdirplus(request(), ROOT_INODE, 0, 0, 0)).unwrap();
         let entries = now(reply.entries.collect::<Vec<_>>());
         assert_eq!(entries.len(), 10);
@@ -1613,10 +1627,77 @@ mod tests {
     fn readdirplus_counts_nothing_after_a_late_error() {
         let bridge = InodePathBridge::new(Listing {
             fail_after: Some(5),
+            stall_after: None,
         });
         assert!(now(bridge.readdirplus(request(), ROOT_INODE, 0, 0, 0)).is_err());
 
         assert!(counted(&bridge).is_empty());
+    }
+
+    #[test]
+    fn readdirplus_cancelled_during_the_listing_counts_nothing() {
+        let bridge = InodePathBridge::new(Listing {
+            fail_after: None,
+            stall_after: Some(1),
+        });
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        {
+            let mut call = Box::pin(bridge.readdirplus(request(), ROOT_INODE, 0, 0, 0));
+            // the first entry is counted, then the listing waits
+            assert!(call.as_mut().poll(&mut cx).is_pending());
+        }
+
+        assert!(counted(&bridge).is_empty());
+    }
+
+    #[test]
+    fn refunds_wait_for_a_busy_lock() {
+        let bridge = InodePathBridge::new(Listing {
+            fail_after: None,
+            stall_after: None,
+        });
+        let reply = now(bridge.readdirplus(request(), ROOT_INODE, 0, 0, 0)).unwrap();
+        let manager = bridge.inode_name_manager.clone();
+
+        run(async move {
+            // the lock is busy (like a forget during shutdown) when the reply
+            // is dropped, so the refund runs in the background
+            let busy = manager.write().await;
+            drop(reply);
+            drop(busy);
+
+            for _ in 0..1000 {
+                if manager.read().await.lookups.is_empty() {
+                    return;
+                }
+                pause().await;
+            }
+            panic!("the refund never ran");
+        });
+    }
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    fn run(fut: impl std::future::Future<Output = ()>) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    async fn pause() {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+    fn run(fut: impl std::future::Future<Output = ()>) {
+        async_global_executor::block_on(fut)
+    }
+
+    #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+    async fn pause() {
+        async_io::Timer::after(std::time::Duration::from_millis(1)).await;
     }
 
     #[test]

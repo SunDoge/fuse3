@@ -4042,6 +4042,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     }
 }
 
+/// Run `fut` in the background on the runtime of the session.
+pub(crate) fn spawn_task<F>(fut: F)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn(debug_span!("fuse3_task"), fut)
+}
+
 #[inline]
 fn spawn<F>(span: Span, fut: F)
 where

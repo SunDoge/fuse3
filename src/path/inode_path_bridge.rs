@@ -1,7 +1,11 @@
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Debug, Formatter};
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
 use async_lock::RwLock;
@@ -177,9 +181,75 @@ impl InodeNameManager {
     }
 }
 
+/// The entries of a readdirplus reply, each holding one lookup count.
+///
+/// The raw layer packs entries in order and stops when the reply buffer is
+/// full, so an entry was packed when the next one is asked for or the stream
+/// ends. When the stream is dropped, the entries that were not packed give
+/// their counts back.
+struct CountedEntries {
+    entries: VecDeque<(DirectoryEntryPlus, Option<Inode>)>,
+    /// The count of the entry handed out last, until it is known to be packed.
+    last: Option<Inode>,
+    inode_name_manager: Arc<RwLock<InodeNameManager>>,
+}
+
+impl Stream for CountedEntries {
+    type Item = Result<DirectoryEntryPlus>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // asking for more means the previous entry was packed
+        self.last = None;
+
+        let next = self.entries.pop_front();
+
+        Poll::Ready(next.map(|(entry, counted)| {
+            self.last = counted;
+
+            Ok(entry)
+        }))
+    }
+}
+
+impl Drop for CountedEntries {
+    fn drop(&mut self) {
+        let unsent = self
+            .last
+            .take()
+            .into_iter()
+            .chain(self.entries.drain(..).filter_map(|(_, counted)| counted))
+            .collect::<Vec<_>>();
+
+        if unsent.is_empty() {
+            return;
+        }
+
+        let forget = move |manager: &mut InodeNameManager| {
+            for inode in &unsent {
+                manager.forget(*inode, 1);
+            }
+        };
+
+        #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+        let manager = self.inode_name_manager.try_write().ok();
+        #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+        let manager = self.inode_name_manager.try_write();
+
+        if let Some(mut manager) = manager {
+            forget(&mut manager);
+        } else {
+            let inode_name_manager = self.inode_name_manager.clone();
+
+            crate::raw::spawn_task(async move {
+                forget(&mut *inode_name_manager.write().await);
+            });
+        }
+    }
+}
+
 pub struct InodePathBridge<FS> {
     path_filesystem: FS,
-    inode_name_manager: RwLock<InodeNameManager>,
+    inode_name_manager: Arc<RwLock<InodeNameManager>>,
 }
 
 impl<FS> InodePathBridge<FS> {
@@ -207,7 +277,7 @@ impl<FS> InodePathBridge<FS> {
 
         Self {
             path_filesystem,
-            inode_name_manager: RwLock::new(inode_name_manager),
+            inode_name_manager: Arc::new(RwLock::new(inode_name_manager)),
         }
     }
 }
@@ -1129,10 +1199,23 @@ where
         futures_util::pin_mut!(entries);
 
         let entries_size = entries.size_hint().1.unwrap_or(0);
-        let mut entry_list = Vec::with_capacity(entries_size);
+        let mut entry_list = VecDeque::with_capacity(entries_size);
 
         while let Some(entry) = entries.next().await {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    // nothing reaches the kernel: give back the counts taken so far
+                    for (_, counted) in entry_list {
+                        if let Some(inode) = counted {
+                            inode_name_manager.forget(inode, 1);
+                        }
+                    }
+
+                    return Err(err);
+                }
+            };
+            let mut counted = None;
 
             let inode = if entry.name == OsStr::new(".") {
                 parent
@@ -1151,25 +1234,36 @@ where
                 let inode = inode_name_manager
                     .get_name_inode(&name)
                     .unwrap_or_else(|| inode_name_manager.insert_name(name));
-                // The kernel counts a lookup for every entry except "." and "..".
+                // The kernel counts a lookup for every entry it receives except
+                // "." and "..". The count is taken now, so the number stays
+                // taken while the reply is built, and given back for entries
+                // that are not sent.
                 inode_name_manager.looked_up(inode);
+                counted = Some(inode);
                 inode
             };
 
-            entry_list.push(Ok(DirectoryEntryPlus {
-                inode,
-                generation: 0,
-                kind: entry.kind,
-                name: entry.name,
-                offset: entry.offset,
-                attr: (inode, entry.attr).into(),
-                entry_ttl: entry.entry_ttl,
-                attr_ttl: entry.attr_ttl,
-            }));
+            entry_list.push_back((
+                DirectoryEntryPlus {
+                    inode,
+                    generation: 0,
+                    kind: entry.kind,
+                    name: entry.name,
+                    offset: entry.offset,
+                    attr: (inode, entry.attr).into(),
+                    entry_ttl: entry.entry_ttl,
+                    attr_ttl: entry.attr_ttl,
+                },
+                counted,
+            ));
         }
 
         Ok(ReplyDirectoryPlus {
-            entries: stream::iter(entry_list),
+            entries: CountedEntries {
+                entries: entry_list,
+                last: None,
+                inode_name_manager: self.inode_name_manager.clone(),
+            },
         })
     }
 
@@ -1280,7 +1374,9 @@ mod tests {
     use super::*;
 
     fn manager() -> InodeNameManager {
-        InodePathBridge::new(()).inode_name_manager.into_inner()
+        Arc::into_inner(InodePathBridge::new(()).inode_name_manager)
+            .unwrap()
+            .into_inner()
     }
 
     fn name(name: &str) -> Name {
@@ -1353,6 +1449,168 @@ mod tests {
         assert_eq!(manager.get_name_inode(&name("b")), Some(a));
         assert_eq!(manager.get_absolute_path(a), Some(PathBuf::from("/b")));
         assert_eq!(manager.get_absolute_path(b), Some(PathBuf::from("/a")));
+    }
+
+    /// A directory with the files "f0".."f9", whose listing fails after
+    /// `fail_after` entries if set.
+    struct Listing {
+        fail_after: Option<usize>,
+    }
+
+    impl PathFilesystem for Listing {
+        async fn init(&self, _req: Request) -> Result<crate::path::reply::ReplyInit> {
+            unimplemented!()
+        }
+
+        async fn destroy(&self, _req: Request) {}
+
+        #[cfg(feature = "file-lock")]
+        async fn getlk(
+            &self,
+            _req: Request,
+            _path: Option<&OsStr>,
+            _fh: u64,
+            _lock_owner: u64,
+            _start: u64,
+            _end: u64,
+            _type: u32,
+            _pid: u32,
+        ) -> Result<crate::path::reply::ReplyLock> {
+            unimplemented!()
+        }
+
+        #[cfg(feature = "file-lock")]
+        async fn setlk(
+            &self,
+            _req: Request,
+            _path: Option<&OsStr>,
+            _fh: u64,
+            _lock_owner: u64,
+            _start: u64,
+            _end: u64,
+            _type: u32,
+            _pid: u32,
+            _block: bool,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn readdirplus<'a>(
+            &'a self,
+            _req: Request,
+            _parent: &'a OsStr,
+            _fh: u64,
+            _offset: u64,
+            _lock_owner: u64,
+        ) -> Result<
+            crate::path::reply::ReplyDirectoryPlus<
+                impl Stream<Item = Result<crate::path::reply::DirectoryEntryPlus>> + Send + 'a,
+            >,
+        > {
+            let now = std::time::SystemTime::now();
+            let entries = (0..10).map(move |i| {
+                if self.fail_after == Some(i) {
+                    return Err(Errno::from(libc::EIO));
+                }
+
+                Ok(crate::path::reply::DirectoryEntryPlus {
+                    kind: crate::FileType::RegularFile,
+                    name: OsString::from(format!("f{i}")),
+                    offset: i as i64 + 1,
+                    attr: crate::path::reply::FileAttr {
+                        size: 0,
+                        blocks: 0,
+                        atime: now,
+                        mtime: now,
+                        ctime: now,
+                        #[cfg(target_os = "macos")]
+                        crtime: now,
+                        kind: crate::FileType::RegularFile,
+                        perm: 0o644,
+                        nlink: 1,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        #[cfg(target_os = "macos")]
+                        flags: 0,
+                        blksize: 4096,
+                    },
+                    entry_ttl: std::time::Duration::from_secs(1),
+                    attr_ttl: std::time::Duration::from_secs(1),
+                })
+            });
+
+            Ok(crate::path::reply::ReplyDirectoryPlus {
+                entries: stream::iter(entries),
+            })
+        }
+    }
+
+    /// Run a future that finishes without waiting.
+    fn now<F: std::future::Future>(fut: F) -> F::Output {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(fut).poll(&mut cx) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("the future had to wait"),
+        }
+    }
+
+    fn request() -> Request {
+        Request {
+            unique: 1,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+
+    fn counted(bridge: &InodePathBridge<Listing>) -> Vec<String> {
+        let manager = now(bridge.inode_name_manager.read());
+        let mut names = manager
+            .lookups
+            .keys()
+            .map(|inode| {
+                let path = manager.get_absolute_path(*inode).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn readdirplus_counts_only_entries_that_were_packed() {
+        let bridge = InodePathBridge::new(Listing { fail_after: None });
+        let reply = now(bridge.readdirplus(request(), ROOT_INODE, 0, 0, 0)).unwrap();
+        let mut entries = Box::pin(reply.entries);
+
+        // like the raw layer: two entries are packed, the third does not fit
+        for _ in 0..3 {
+            assert!(now(entries.next()).unwrap().is_ok());
+        }
+        drop(entries);
+
+        assert_eq!(counted(&bridge), vec!["/f0", "/f1"]);
+    }
+
+    #[test]
+    fn readdirplus_counts_all_entries_of_a_whole_listing() {
+        let bridge = InodePathBridge::new(Listing { fail_after: None });
+        let reply = now(bridge.readdirplus(request(), ROOT_INODE, 0, 0, 0)).unwrap();
+        let entries = now(reply.entries.collect::<Vec<_>>());
+        assert_eq!(entries.len(), 10);
+
+        assert_eq!(counted(&bridge).len(), 10);
+    }
+
+    #[test]
+    fn readdirplus_counts_nothing_after_a_late_error() {
+        let bridge = InodePathBridge::new(Listing {
+            fail_after: Some(5),
+        });
+        assert!(now(bridge.readdirplus(request(), ROOT_INODE, 0, 0, 0)).is_err());
+
+        assert!(counted(&bridge).is_empty());
     }
 
     #[test]

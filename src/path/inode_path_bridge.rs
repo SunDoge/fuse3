@@ -22,6 +22,9 @@ use crate::{Inode, Result};
 
 const ROOT_INODE: Inode = 1;
 
+/// `RENAME_EXCHANGE` of rename2 on Linux.
+const RENAME_EXCHANGE: u32 = 1 << 1;
+
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 struct Name {
     parent: Inode,
@@ -73,6 +76,54 @@ impl InodeNameManager {
                 if !self.lookups.contains_key(&inode) {
                     self.inode_generator.release_inode(inode);
                 }
+            }
+        }
+    }
+
+    fn add_name(&mut self, inode: Inode, name: Name) {
+        self.name_to_inode.insert(name.clone(), inode);
+        self.inode_to_names.entry(inode).or_default().insert(name);
+    }
+
+    /// Move the name `old` to `new`. The inode keeps its number, like the kernel
+    /// keeps its inode for the renamed entry. An inode that had the name `new`
+    /// loses it.
+    fn rename_name(&mut self, old: &Name, new: Name) {
+        if *old == new {
+            return;
+        }
+
+        self.remove_name(&new);
+
+        match self.get_name_inode(old) {
+            Some(inode) => {
+                // add the new name first, so the inode never runs out of names
+                self.add_name(inode, new);
+                self.remove_name(old);
+            }
+
+            None => {
+                self.insert_name(new);
+            }
+        }
+    }
+
+    /// Swap the inodes of the names `a` and `b` (rename with `RENAME_EXCHANGE`).
+    fn exchange_names(&mut self, a: &Name, b: &Name) {
+        match (self.get_name_inode(a), self.get_name_inode(b)) {
+            (Some(inode_a), Some(inode_b)) => {
+                for (inode, old, new) in [(inode_a, a, b), (inode_b, b, a)] {
+                    if let Some(names) = self.inode_to_names.get_mut(&inode) {
+                        names.remove(old);
+                        names.insert(new.clone());
+                    }
+                    self.name_to_inode.insert(new.clone(), inode);
+                }
+            }
+
+            _ => {
+                self.remove_name(a);
+                self.remove_name(b);
             }
         }
     }
@@ -507,13 +558,10 @@ where
             )
             .await?;
 
-        inode_name_manager.remove_name(&Name::new(parent, name.to_owned()));
-
-        let new_name = Name::new(new_parent, new_name.to_owned());
-
-        inode_name_manager
-            .get_name_inode(&new_name)
-            .unwrap_or_else(|| inode_name_manager.insert_name(new_name));
+        inode_name_manager.rename_name(
+            &Name::new(parent, name.to_owned()),
+            Name::new(new_parent, new_name.to_owned()),
+        );
 
         Ok(())
     }
@@ -1155,13 +1203,14 @@ where
             )
             .await?;
 
-        inode_name_manager.remove_name(&Name::new(parent, name.to_owned()));
-
+        let old_name = Name::new(parent, name.to_owned());
         let new_name = Name::new(new_parent, new_name.to_owned());
 
-        inode_name_manager
-            .get_name_inode(&new_name)
-            .unwrap_or_else(|| inode_name_manager.insert_name(new_name));
+        if flags & RENAME_EXCHANGE != 0 {
+            inode_name_manager.exchange_names(&old_name, &new_name);
+        } else {
+            inode_name_manager.rename_name(&old_name, new_name);
+        }
 
         Ok(())
     }
@@ -1273,6 +1322,37 @@ mod tests {
         assert_eq!(manager.get_name_inode(&name("file")), None);
         assert!(manager.get_absolute_path(inode).is_none());
         assert!(manager.name_to_inode.is_empty());
+    }
+
+    #[test]
+    fn renamed_inode_keeps_its_number() {
+        let mut manager = manager();
+        let moved = manager.insert_name(name("from"));
+        manager.looked_up(moved);
+        let replaced = manager.insert_name(name("to"));
+        manager.looked_up(replaced);
+
+        manager.rename_name(&name("from"), name("to"));
+        assert_eq!(manager.get_name_inode(&name("to")), Some(moved));
+        assert_eq!(manager.get_name_inode(&name("from")), None);
+        assert_eq!(manager.get_absolute_path(moved), Some(PathBuf::from("/to")));
+        // the replaced file may still be open: its number stays taken
+        let new = manager.insert_name(name("new"));
+        assert_ne!(new, replaced);
+        assert_ne!(new, moved);
+    }
+
+    #[test]
+    fn exchanged_names_swap_inodes() {
+        let mut manager = manager();
+        let a = manager.insert_name(name("a"));
+        let b = manager.insert_name(name("b"));
+
+        manager.exchange_names(&name("a"), &name("b"));
+        assert_eq!(manager.get_name_inode(&name("a")), Some(b));
+        assert_eq!(manager.get_name_inode(&name("b")), Some(a));
+        assert_eq!(manager.get_absolute_path(a), Some(PathBuf::from("/b")));
+        assert_eq!(manager.get_absolute_path(b), Some(PathBuf::from("/a")));
     }
 
     #[test]

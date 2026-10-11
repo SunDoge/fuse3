@@ -2923,7 +2923,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                 let padding_size = get_padding_size(dir_entry_size);
 
-                if entry_data.len() + dir_entry_size > max_size {
+                // the padding is sent too, so it must fit as well
+                if !dir_entry_fits(entry_data.len(), dir_entry_size, max_size) {
                     break;
                 }
 
@@ -3768,7 +3769,8 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                 let padding_size = get_padding_size(dir_entry_size);
 
-                if entry_data.len() + dir_entry_size > max_size {
+                // the padding is sent too, so it must fit as well
+                if !dir_entry_fits(entry_data.len(), dir_entry_size, max_size) {
                     break;
                 }
 

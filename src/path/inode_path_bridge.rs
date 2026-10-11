@@ -140,6 +140,12 @@ impl InodeNameManager {
     /// The kernel forgot `nlookup` lookups of `inode`. When no lookup is left,
     /// the inode and its names are removed and its number may be reused.
     fn forget(&mut self, inode: Inode, nlookup: u64) {
+        // the root lives as long as the session; the kernel may still forget it
+        // while unmounting
+        if inode == ROOT_INODE {
+            return;
+        }
+
         if let Some(count) = self.lookups.get_mut(&inode) {
             *count = count.saturating_sub(nlookup);
 
@@ -1611,6 +1617,19 @@ mod tests {
         assert!(now(bridge.readdirplus(request(), ROOT_INODE, 0, 0, 0)).is_err());
 
         assert!(counted(&bridge).is_empty());
+    }
+
+    #[test]
+    fn root_is_never_forgotten() {
+        let mut manager = manager();
+        manager.forget(ROOT_INODE, 1);
+
+        assert_eq!(
+            manager.get_absolute_path(ROOT_INODE),
+            Some(PathBuf::from("/"))
+        );
+        // the root number is not handed out again
+        assert_ne!(manager.insert_name(name("file")), ROOT_INODE);
     }
 
     #[test]

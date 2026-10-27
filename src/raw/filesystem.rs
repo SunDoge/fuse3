@@ -15,6 +15,15 @@ pub trait Filesystem {
     /// initialize filesystem. Called before any other filesystem method.
     async fn init(&self, req: Request) -> Result<ReplyInit>;
 
+    /// Called after the kernel INIT reply has been sent successfully, before dispatching
+    /// further requests. Store this notifier to invalidate cached inodes or directory
+    /// entries after changes made outside the mount (for example by a background service).
+    ///
+    /// Return promptly: request dispatch starts when this callback returns. Do not wait
+    /// for operations against the mount here. Send invalidations from a separate task,
+    /// outside filesystem locks and request handlers that may be needed by writeback.
+    async fn ready(&self, notify: Notify) {}
+
     /// clean up filesystem. Called on filesystem exit which is fuseblk, in normal fuse filesystem,
     /// kernel may call forget for root. There is some discuss for this
     /// <https://github.com/bazil/fuse/issues/82#issuecomment-88126886>,

@@ -30,6 +30,12 @@ jobs:
       - name: Clippy (async-io-runtime)
         run: cargo clippy --all-targets --features=async-io-runtime,file-lock,unprivileged
 
+      - name: Unit tests (tokio-runtime)
+        run: cargo test --lib --features=tokio-runtime,file-lock,unprivileged
+
+      - name: Unit tests (async-io-runtime)
+        run: cargo test --lib --features=async-io-runtime,file-lock,unprivileged
+
       - name: Doc
         run: cargo doc --features=file-lock,unprivileged,tokio-runtime
 
